@@ -156,4 +156,6 @@ constexpr auto operator"" _fnv1a(const char32_t *s, size_t len)
 #include <wil/resource.h>
 #include <wil/result.h>
 
+#include <pe/module.h"
+
 #endif //PCH_H

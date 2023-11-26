@@ -6,6 +6,7 @@
 #include "thread_local_mutex.h"
 #include "FastWildCompare.hpp"
 #include "wl.h"
+#include "searchers.h"
 
 static UNICODE_STRING Util_GetFileName(const UNICODE_STRING &FullName)
 {
@@ -499,7 +500,7 @@ HRESULT Init()
   std::optional<std::wstring> ofilename;
   LPVOID buffer;
   UINT len;
-  
+
   if ( VerQueryValueW(block.data(), L"\\", &buffer, &len) && len == sizeof(VS_FIXEDFILEINFO) ) {
     const auto vsf = static_cast<VS_FIXEDFILEINFO *>(buffer);
     GVersion.major = HIWORD(vsf->dwProductVersionMS);
@@ -544,14 +545,18 @@ HRESULT Init()
 
     wil::unique_hmodule hlib{LoadLibraryExW(entry.path().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)};
     if ( hlib ) {
-      const auto info = reinterpret_cast<const PluginInfo *>(GetProcAddress(hlib.get(), "GPluginInfo")); // allow both
+       auto info = reinterpret_cast< PluginInfo *>(GetProcAddress(hlib.get(), "GPluginInfo")); // allow both
       if ( info && info->sdk_version >= 3 ) {
-        std::wstring targetApps{info->sdk_version >= Version{3, 1} && info->target_apps ? info->target_apps : L"Client.exe"};
+        std::wstring targetApps{info->sdk_version >= Version{3, 1} && info->target_apps ? info->target_apps : L"BNSR.exe"};
         wchar_t *context;
         auto token = wcstok_s(targetApps.data(), L";", &context);
         while ( token ) {
           if ( (ofilename && FastWildCompareW(ofilename->c_str(), token))
             || FastWildCompareW(filename.c_str(), token) ) {
+            if (info->sdk_version >= Version{ 3, 2 }) {
+              info->engine_init_available = bEngineInit_Hooked;
+              info->loader3_version = Version{ 3, 2, 1 };
+            }
             GPlugins.emplace_back(std::move(hlib), info, entry.path());
             break;
           }
@@ -581,6 +586,45 @@ HRESULT Init()
   return S_OK;
 }
 
+__int64(__fastcall* FEngineLoop_Init)(uintptr_t* This);
+__int64 __fastcall FEngineLoop_Init_Hook(uintptr_t* This) {
+  auto inited = FEngineLoop_Init(This);
+
+  for (const auto& item : GPlugins) {
+    if (item.info->sdk_version >= Version{ 3, 2 }) {
+      if (item.info->engine_init)
+        item.info->engine_init(GVersion);
+    }
+  }
+
+  return inited;
+}
+
+// Dirty Tonic edit, defiling this source with copy paste caveman ways
+HRESULT Engine_Hooks() {
+  if (const auto module = pe::get_module()) {
+    DetourTransactionBegin();
+    DetourUpdateThread(NtCurrentThread());
+    uintptr_t handle = module->handle();
+
+    const auto sections = module->segments();
+    const auto& section = std::find_if(sections.begin(), sections.end(), [](const IMAGE_SECTION_HEADER& x) {
+      return x.Characteristics & IMAGE_SCN_CNT_CODE;
+      });
+    const auto data = section->as_bytes();
+
+    auto result = std::search(data.begin(), data.end(), pattern_searcher(xorstr_("48 8D A8 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 48 C7 45 ?? ?? ?? ?? ?? 48 89 58 ?? 48 89 70 ?? 48 89 78 ?? 0F 29 70 ?? 0F 29 78 ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 ?? ?? ?? ?? 4C 8B F9 33 FF 89 7C 24")));
+    if (result != data.end()) {
+      FEngineLoop_Init = module->rva_to<std::remove_pointer_t<decltype(FEngineLoop_Init)>>((uintptr_t)&result[0] - 0x8 - handle);
+      auto hooked = DetourAttach(&(PVOID&)FEngineLoop_Init, &FEngineLoop_Init_Hook);
+      auto response = DetourTransactionCommit();
+      if (hooked == NO_ERROR && response == NO_ERROR)
+        bEngineInit_Hooked = true;
+    }
+  }
+  return S_OK;
+}
+
 decltype(&GetSystemTimeAsFileTime) g_pfnGetSystemTimeAsFileTime;
 VOID WINAPI GetSystemTimeAsFileTime_hook(LPFILETIME lpSystemTimeAsFileTime)
 {
@@ -603,6 +647,7 @@ VOID WINAPI GetSystemTimeAsFileTime_hook(LPFILETIME lpSystemTimeAsFileTime)
       if ( it == Callers.end() || mbi.AllocationBase != NtCurrentPeb()->ImageBaseAddress )
         return E_FAIL;
 
+      RETURN_IF_FAILED(Engine_Hooks());
       RETURN_IF_FAILED(Init());
 
       for ( const auto &item : GPlugins ) {

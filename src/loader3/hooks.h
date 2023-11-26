@@ -102,3 +102,5 @@ HWND WINAPI FindWindowA_hook(
 extern decltype(&GetSystemTimeAsFileTime) g_pfnGetSystemTimeAsFileTime;
 VOID WINAPI GetSystemTimeAsFileTime_hook(
   _Out_ LPFILETIME lpSystemTimeAsFileTime);
+
+  extern __int64(__fastcall* FEngineLoop_Init)(uintptr_t* This);
